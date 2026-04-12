@@ -461,7 +461,7 @@ dependencies = [
 [[package]]
 name = "spiral-rs"
 version = "0.3.0"
-source = "git+https://github.com/menonsamir/spiral-rs.git?rev=6929441#6929441c6551769b7d099d3af3df347cde3bae7b"
+source = "git+https://github.com/codygunton/spiral-rs.git?rev=707c1be6b1455d88420818959ccdedc1f4ddb6d0#707c1be6b1455d88420818959ccdedc1f4ddb6d0"
 dependencies = [
  "fastrand",
  "getrandom",
