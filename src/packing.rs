@@ -1,4 +1,6 @@
-use std::{arch::x86_64::*, time::Instant};
+use std::time::Instant;
+#[cfg(target_feature = "avx512f")]
+use std::arch::x86_64::*;
 
 use log::debug;
 
@@ -678,6 +680,7 @@ pub fn fast_add_into(res: &mut PolyMatrixNTT, a: &PolyMatrixNTT) {
     }
 }
 
+#[cfg(target_feature = "avx512f")]
 pub fn fast_multiply_no_reduce(
     params: &Params,
     res: &mut PolyMatrixNTT,
@@ -728,6 +731,48 @@ pub fn fast_multiply_no_reduce(
     }
 }
 
+/// Portable fallback for `fast_multiply_no_reduce`. Computes the same
+/// 1×L · L×1 poly-matmul over CRT-packed inputs (lo in bits 0..32, hi in
+/// bits 32..64) and stores the per-limb u64 sums in split form
+/// (lo at res[idx], hi at res[pol_sz + idx]).
+#[cfg(not(target_feature = "avx512f"))]
+pub fn fast_multiply_no_reduce(
+    params: &Params,
+    res: &mut PolyMatrixNTT,
+    a: &PolyMatrixNTT,
+    b: &PolyMatrixNTT,
+    _start_inner_dim: usize,
+) {
+    assert_eq!(res.rows, a.rows);
+    assert_eq!(res.cols, b.cols);
+    assert_eq!(res.rows, 1);
+    assert_eq!(res.cols, 1);
+    assert_eq!(a.cols, b.rows);
+    assert_eq!(params.crt_count * params.poly_len, 2 * 2048);
+
+    let a_slc = a.as_slice();
+    let b_slc = b.as_slice();
+    let res_slc = res.as_mut_slice();
+    let pol_sz = params.poly_len;
+
+    for idx in 0..pol_sz {
+        let mut sum_lo: u64 = 0;
+        let mut sum_hi: u64 = 0;
+        for k in 0..a.cols {
+            let x = a_slc[k * 2 * pol_sz + idx];
+            let y = b_slc[k * 2 * pol_sz + idx];
+            let x_lo = x & 0xffff_ffff;
+            let x_hi = x >> 32;
+            let y_lo = y & 0xffff_ffff;
+            let y_hi = y >> 32;
+            sum_lo = sum_lo.wrapping_add(x_lo.wrapping_mul(y_lo));
+            sum_hi = sum_hi.wrapping_add(x_hi.wrapping_mul(y_hi));
+        }
+        res_slc[idx] = sum_lo;
+        res_slc[pol_sz + idx] = sum_hi;
+    }
+}
+
 pub fn condense_matrix<'a>(params: &'a Params, a: &PolyMatrixNTT<'a>) -> PolyMatrixNTT<'a> {
     let mut res = PolyMatrixNTT::zero(params, a.rows, a.cols);
     for i in 0..a.rows {
@@ -757,6 +802,7 @@ pub fn uncondense_matrix<'a>(params: &'a Params, a: &PolyMatrixNTT<'a>) -> PolyM
     res
 }
 
+#[cfg(target_feature = "avx512f")]
 pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
     unsafe {
         let a_ptr = a.as_ptr();
@@ -779,6 +825,18 @@ pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[
     }
 }
 
+/// Portable fallback. `_mm512_mul_epu32` multiplies the lo-32 of each u64
+/// lane — we replicate that u32×u32→u64 semantics scalar-wise.
+#[cfg(not(target_feature = "avx512f"))]
+pub fn multiply_add_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
+    for i in 0..res.len() {
+        let x_lo = a[i] & 0xffff_ffff;
+        let y_lo = b[i] & 0xffff_ffff;
+        res[i] = res[i].wrapping_add(x_lo.wrapping_mul(y_lo));
+    }
+}
+
+#[cfg(target_feature = "avx512f")]
 pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
     unsafe {
         let a_ptr = a.as_ptr();
@@ -797,6 +855,15 @@ pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]
 
             _mm512_store_si512(p_z as *mut _, product);
         }
+    }
+}
+
+#[cfg(not(target_feature = "avx512f"))]
+pub fn multiply_poly_avx(_params: &Params, res: &mut [u64], a: &[u64], b: &[u64]) {
+    for i in 0..res.len() {
+        let x_lo = a[i] & 0xffff_ffff;
+        let y_lo = b[i] & 0xffff_ffff;
+        res[i] = x_lo.wrapping_mul(y_lo);
     }
 }
 

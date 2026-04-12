@@ -1,9 +1,14 @@
+#[cfg(target_feature = "avx512f")]
 use std::arch::x86_64::*;
 
 use spiral_rs::{arith::*, params::*};
 
+#[cfg(target_feature = "avx512f")]
 use super::server::ToM512;
+#[cfg(not(target_feature = "avx512f"))]
+use super::server::ToU64;
 
+#[cfg(target_feature = "avx512f")]
 pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy>(
     params: &Params,
     c: &mut [u64],
@@ -126,6 +131,57 @@ pub fn fast_batched_dot_product_avx512<const K: usize, T: Copy>(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Portable (non-AVX-512) fallback for `fast_batched_dot_product_avx512`.
+///
+/// Equivalent semantics to the AVX-512 kernel: for each of the K batches,
+/// compute `c[batch, j] = sum_k a[batch, k] * b_t[j * b_rows + k]` with the
+/// a-values CRT-packed (lo 32 bits and hi 32 bits multiplied separately),
+/// Barrett-reduced per limb, and CRT-composed back into a single u64.
+#[cfg(not(target_feature = "avx512f"))]
+pub fn fast_batched_dot_product_avx512<const K: usize, T>(
+    params: &Params,
+    c: &mut [u64],
+    a: &[u64],
+    a_elems: usize,
+    b_t: &[T],
+    b_rows: usize,
+    b_cols: usize,
+) where
+    T: Copy + ToU64,
+{
+    assert_eq!(a_elems, b_rows);
+
+    let a_stride = a.len() / K;
+    let c_stride = c.len() / K;
+
+    for j in 0..b_cols {
+        let mut sum_lo = [0u64; K];
+        let mut sum_hi = [0u64; K];
+
+        for k in 0..a_elems {
+            let b_val: u64 = b_t[j * b_rows + k].to_u64();
+
+            for batch in 0..K {
+                let a_val = a[batch * a_stride + k];
+                let a_lo = a_val & 0xffff_ffff;
+                let a_hi = a_val >> 32;
+                // u32 * u32 -> u64; these can never overflow u64 because
+                // a_lo, a_hi < 2^32 and b_val originates from a u8/u16/u32.
+                sum_lo[batch] = sum_lo[batch].wrapping_add(a_lo.wrapping_mul(b_val));
+                sum_hi[batch] = sum_hi[batch].wrapping_add(a_hi.wrapping_mul(b_val));
+            }
+        }
+
+        for batch in 0..K {
+            let lo = barrett_coeff_u64(params, sum_lo[batch], 0);
+            let hi = barrett_coeff_u64(params, sum_hi[batch], 1);
+            let res = params.crt_compose_2(lo, hi);
+            let prev = c[batch * c_stride + j];
+            c[batch * c_stride + j] = barrett_u64(params, prev + res);
         }
     }
 }

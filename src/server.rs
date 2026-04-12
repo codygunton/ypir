@@ -1222,6 +1222,11 @@ mod m512_impl {
     }
 }
 
+// Placeholder impls used only to satisfy trait bounds on non-AVX-512 targets.
+// The AVX-512 code path that actually calls `.to_m512()` is cfg-gated out on
+// these targets, so these bodies are unreachable. They return a zeroed value
+// that is a valid bit-pattern for whatever `__m512i` is on this target
+// (the real struct on x86 with AVX2, the `u64` alias elsewhere).
 #[cfg(not(target_feature = "avx512f"))]
 mod m512_impl {
     use super::*;
@@ -1229,21 +1234,21 @@ mod m512_impl {
     impl ToM512 for *const u8 {
         #[inline(always)]
         fn to_m512(self) -> __m512i {
-            self as __m512i
+            unsafe { std::mem::zeroed() }
         }
     }
 
     impl ToM512 for *const u16 {
         #[inline(always)]
         fn to_m512(self) -> __m512i {
-            self as __m512i
+            unsafe { std::mem::zeroed() }
         }
     }
 
     impl ToM512 for *const u32 {
         #[inline(always)]
         fn to_m512(self) -> __m512i {
-            self as __m512i
+            unsafe { std::mem::zeroed() }
         }
     }
 }
