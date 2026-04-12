@@ -5,6 +5,7 @@ use std::{marker::PhantomData, ops::Range, time::Instant};
 use log::debug;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 
 use spiral_rs::aligned_memory::AlignedMemory64;
 use spiral_rs::{arith::*, client::*, params::*, poly::*};
@@ -180,7 +181,7 @@ impl DbRowsPadded for Params {
 
 impl<'a, T> YServer<'a, T>
 where
-    T: Sized + Copy + ToU64 + Default,
+    T: Sized + Copy + ToU64 + Default + Sync,
     *const T: ToM512,
 {
     pub fn new<'b, I>(
@@ -809,15 +810,45 @@ where
         let first_pass = Instant::now();
         debug!("Performing mul...");
         let mut intermediate = AlignedMemory64::new(db_cols);
-        fast_batched_dot_product_avx512::<1, T>(
-            &params,
-            intermediate.as_mut_slice(),
-            first_dim_queries_packed,
-            db_rows,
-            self.db(),
-            db_rows,
-            db_cols,
-        );
+
+        // Parallelize the dot product across output columns.
+        // Each column j is independent: c[j] = dot(query, db_col[j]).
+        // Split columns into thread-sized chunks and run the existing
+        // AVX-512 kernel on each chunk concurrently.
+        let db = self.db();
+        let num_threads = rayon::current_num_threads().min(db_cols / params.poly_len);
+        if num_threads > 1 {
+            // Align chunk boundaries to poly_len for clean instance splits
+            let cols_per_chunk = (db_cols / num_threads / params.poly_len) * params.poly_len;
+            intermediate.as_mut_slice()
+                .par_chunks_mut(cols_per_chunk)
+                .enumerate()
+                .for_each(|(ci, c_chunk)| {
+                    let j_start = ci * cols_per_chunk;
+                    let n_cols = c_chunk.len();
+                    let b_offset = j_start * db_rows;
+                    let db_chunk = &db[b_offset..b_offset + n_cols * db_rows];
+                    fast_batched_dot_product_avx512::<1, T>(
+                        params,
+                        c_chunk,
+                        first_dim_queries_packed,
+                        db_rows,
+                        db_chunk,
+                        db_rows,
+                        n_cols,
+                    );
+                });
+        } else {
+            fast_batched_dot_product_avx512::<1, T>(
+                params,
+                intermediate.as_mut_slice(),
+                first_dim_queries_packed,
+                db_rows,
+                db,
+                db_rows,
+                db_cols,
+            );
+        }
         debug!("Done w mul...");
         let first_pass_time_ms = first_pass.elapsed().as_millis();
         if let Some(ref mut m) = measurement {
