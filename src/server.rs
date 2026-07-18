@@ -21,6 +21,7 @@ use super::{
     lwe::*,
     matmul::matmul_vec_packed,
     modulus_switch::ModulusSwitch,
+    offline_tail::{offline_values_from_parts, OfflineTail, TailDecodeError},
     packing::*,
     params::*,
     scheme::*,
@@ -694,6 +695,20 @@ where
         }
     }
 
+    /// Rebuilds the SimplePIR offline values from a persisted hint *and* a persisted packing tail,
+    /// skipping `prep_pack_many_lwes` and `precompute_pack` entirely.
+    ///
+    /// Prefer this over [`Self::perform_offline_precomputation_simplepir_from_hint`] whenever a
+    /// tail artifact is available; fall back to that on `Err`, since older artifacts have no tail.
+    pub fn perform_offline_precomputation_simplepir_from_parts(
+        &self,
+        hint_0: Vec<u64>,
+        tail: &OfflineTail,
+    ) -> Result<OfflinePrecomputedValues<'a>, TailDecodeError> {
+        assert!(self.ypir_params.is_simplepir);
+        offline_values_from_parts(self.params, hint_0, tail)
+    }
+
     pub fn perform_offline_precomputation(
         &self,
         measurement: Option<&mut Measurement>,
@@ -1327,12 +1342,16 @@ mod tests {
             &fresh_offline.y_constants.1,
         );
         // `fake_pack_pub_params` is drawn from entropy by `generate_fake_pack_pub_params`, so it
-        // (and the `precomp` entries derived from it) can only be compared by shape. The packing
-        // step cancels these placeholders out, so the online responses must still match exactly.
+        // genuinely can only be compared by shape.
         assert_eq!(
             restored_offline.fake_pack_pub_params.len(),
             fresh_offline.fake_pack_pub_params.len()
         );
+        // `precomp`, however, is deterministic apart from row 1 of `.0`. The gadget-inverse chain
+        // in `precompute_pack` reads only row 0 of the fake params -- the seeded `-a` -- so `.1`
+        // and `.2` are bit-identical across draws, as is row 0 of `.0`. Row 1 of `.0` is the sole
+        // entropy-tainted value, and `pack_using_precomp_vals` overwrites it wholesale before use.
+        // That is the invariant the persisted tail rests on; see `src/offline_tail.rs`.
         assert_eq!(restored_offline.precomp.len(), fresh_offline.precomp.len());
         for (restored_tup, fresh_tup) in restored_offline
             .precomp
@@ -1343,7 +1362,8 @@ mod tests {
                 (restored_tup.0.rows, restored_tup.0.cols),
                 (fresh_tup.0.rows, fresh_tup.0.cols)
             );
-            assert_eq!(restored_tup.1.len(), fresh_tup.1.len());
+            assert_eq!(restored_tup.0.get_poly(0, 0), fresh_tup.0.get_poly(0, 0));
+            assert_pms_eq(&restored_tup.1, &fresh_tup.1);
             assert_eq!(restored_tup.2, fresh_tup.2);
         }
 
@@ -1424,6 +1444,376 @@ mod tests {
         assert_eq!(fresh_decoded.len(), db_cols);
         assert_eq!(fresh_decoded, corr_result);
         assert_eq!(restored_decoded, corr_result);
+    }
+
+    /// The same correctness gate as `preformatted_simplepir_db_and_hint_match_fresh_server`, but
+    /// for the persisted-tail path: the restored server recomputes *nothing*, taking both the hint
+    /// and the offline tail from their on-disk byte forms. Everything the gate above proves about
+    /// the from_hint path -- content equality of the deterministic offline values, a byte-identical
+    /// response to a real client query, and a decode that matches the source data rather than a
+    /// read-back -- must hold here too, and the two restore paths must agree with each other.
+    #[test]
+    fn preformatted_simplepir_db_and_tail_match_fresh_server() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_cols = params.instances * params.poly_len;
+        let fresh = YServer::<u16>::new(
+            &params,
+            (0..db_rows * db_cols).map(|i| (i % params.pt_modulus as usize) as u16),
+            true,
+            false,
+            true,
+        );
+        let fresh_offline = fresh.perform_offline_precomputation_simplepir(None);
+
+        // Every input to the restored server crosses the byte boundary, exactly as it will on
+        // disk: the database as raw column-major bytes, the hint as the little-endian u64 stream
+        // in `hint.bin`, and the tail as its serialized artifact.
+        let hint_from_bytes = fresh_offline
+            .hint_0
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<u64>>();
+
+        let tail_bytes = fresh_offline.offline_tail().to_bytes();
+        assert_eq!(tail_bytes.len(), fresh_offline.offline_tail().encoded_len());
+        let tail_from_bytes = OfflineTail::from_bytes(&tail_bytes).unwrap();
+        // The tail carries no entropy, so re-extracting it from the restored values must reproduce
+        // the artifact byte for byte.
+        assert_eq!(tail_from_bytes.to_bytes(), tail_bytes);
+
+        let restored =
+            YServer::<u16>::from_col_major(&params, true, true, fresh.db_col_major_bytes());
+        let restored_offline = restored
+            .perform_offline_precomputation_simplepir_from_parts(
+                hint_from_bytes.clone(),
+                &tail_from_bytes,
+            )
+            .unwrap();
+
+        assert_eq!(restored.db_col_major_bytes(), fresh.db_col_major_bytes());
+        assert_eq!(restored_offline.hint_0, fresh_offline.hint_0);
+
+        // The offline values must match in content, not merely in shape.
+        assert_pms_eq(
+            &restored_offline.y_constants.0,
+            &fresh_offline.y_constants.0,
+        );
+        assert_pms_eq(
+            &restored_offline.y_constants.1,
+            &fresh_offline.y_constants.1,
+        );
+        // Two fields are deliberately left empty rather than rebuilt, and the response equality
+        // below is what proves that is safe. `prepacked_lwe` reaches `pack_many_lwes` only through
+        // shape asserts (`simplepir_online_ignores_prepacked_lwe_contents`), and
+        // `fake_pack_pub_params` is consumed solely by the `precompute_pack` we skipped.
+        assert!(restored_offline.prepacked_lwe.is_empty());
+        assert!(restored_offline.fake_pack_pub_params.is_empty());
+        assert!(!fresh_offline.prepacked_lwe.is_empty());
+
+        // `precomp` is compared exactly as in the gate above: deterministic apart from row 1 of
+        // `.0`, which is entropy-tainted and overwritten by `pack_using_precomp_vals` before it is
+        // read (`simplepir_precomp_ignores_res_row_1`). The tail zeroes it on extraction.
+        assert_eq!(restored_offline.precomp.len(), fresh_offline.precomp.len());
+        for (restored_tup, fresh_tup) in restored_offline
+            .precomp
+            .iter()
+            .zip(fresh_offline.precomp.iter())
+        {
+            assert_eq!(
+                (restored_tup.0.rows, restored_tup.0.cols),
+                (fresh_tup.0.rows, fresh_tup.0.cols)
+            );
+            assert_eq!(restored_tup.0.get_poly(0, 0), fresh_tup.0.get_poly(0, 0));
+            assert_pms_eq(&restored_tup.1, &fresh_tup.1);
+            assert_eq!(restored_tup.2, fresh_tup.2);
+        }
+
+        // Generate a real client query for a known row, as in `run_simple_ypir_on_params`.
+        let target_row = 3;
+        let mut client = Client::init(&params);
+        client.generate_secret_keys();
+        let sk_reg = &client.get_sk_reg();
+        let pack_pub_params = raw_generate_expansion_params(
+            &params,
+            &sk_reg,
+            params.poly_len_log2,
+            params.t_exp_left,
+            &mut ChaCha20Rng::from_entropy(),
+            &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+        );
+        let pack_pub_params_row_1s = pack_pub_params
+            .iter()
+            .map(|p| condense_matrix(&params, &p.submatrix(1, 0, 1, p.cols)))
+            .collect::<Vec<_>>();
+
+        let y_client = YClient::new(&mut client, &params);
+        let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row);
+        assert_eq!(query_row.len(), db_rows);
+        let packed_query_row = pack_query(&params, &query_row);
+
+        // The query must be 64-byte aligned for the AVX-512 kernel.
+        let mut query = AlignedMemory64::new(params.db_rows_padded());
+        (&mut query.as_mut_slice()[..db_rows]).copy_from_slice(packed_query_row.as_slice());
+
+        assert_eq!(
+            as_bytes(&restored.answer_query(query.as_slice())),
+            as_bytes(&fresh.answer_query(query.as_slice()))
+        );
+
+        // The full online responses must be byte-identical -- including against the from_hint
+        // restore, so the two persisted-artifact paths are proven interchangeable.
+        let pack_pub_params_row_1s = [pack_pub_params_row_1s.as_slice()];
+        let fresh_response = fresh.perform_online_computation_simplepir(
+            query.as_slice(),
+            &fresh_offline,
+            &pack_pub_params_row_1s,
+            None,
+        );
+        let restored_response = restored.perform_online_computation_simplepir(
+            query.as_slice(),
+            &restored_offline,
+            &pack_pub_params_row_1s,
+            None,
+        );
+        assert_eq!(restored_response, fresh_response);
+
+        let from_hint_offline =
+            restored.perform_offline_precomputation_simplepir_from_hint(hint_from_bytes);
+        let from_hint_response = restored.perform_online_computation_simplepir(
+            query.as_slice(),
+            &from_hint_offline,
+            &pack_pub_params_row_1s,
+            None,
+        );
+        assert_eq!(restored_response, from_hint_response);
+
+        // ...and so must the decoded plaintexts, which must equal the original DB record.
+        let decode = |response: &[Vec<u8>]| {
+            response
+                .iter()
+                .flat_map(|ct_bytes| {
+                    let ct = PolyMatrixRaw::recover(
+                        &params,
+                        params.get_q_prime_1(),
+                        params.get_q_prime_2(),
+                        ct_bytes,
+                    );
+                    decrypt_ct_reg_measured(y_client.client(), &params, &ct.ntt(), params.poly_len)
+                        .as_slice()
+                        .to_vec()
+                })
+                .collect::<Vec<u64>>()
+        };
+        // Ground truth comes from the source data the database was built from, not from reading
+        // the server back through `get_row` -- otherwise a mis-laid-out ingest would agree with
+        // itself and go unnoticed.
+        let corr_result = (0..db_cols)
+            .map(|col| ((target_row * db_cols + col) % params.pt_modulus as usize) as u64)
+            .collect::<Vec<u64>>();
+        let fresh_decoded = decode(&fresh_response);
+        let restored_decoded = decode(&restored_response);
+        assert_eq!(fresh_decoded.len(), db_cols);
+        assert_eq!(fresh_decoded, corr_result);
+        assert_eq!(restored_decoded, corr_result);
+        assert_eq!(decode(&from_hint_response), corr_result);
+    }
+
+    /// Builds a SimplePIR server plus a real client query against it, as
+    /// `preformatted_simplepir_db_and_hint_match_fresh_server` does. Returns everything the online
+    /// path needs, so the tests below can focus on the offline values under test.
+    ///
+    /// `YClient::new` borrows the client for the params lifetime, so the caller must own it.
+    fn simplepir_fixture<'a>(
+        params: &'a Params,
+        client: &'a mut Client<'a>,
+    ) -> (YServer<'a, u16>, AlignedMemory64, Vec<PolyMatrixNTT<'a>>) {
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_cols = params.instances * params.poly_len;
+        let server = YServer::<u16>::new(
+            params,
+            (0..db_rows * db_cols).map(|i| (i % params.pt_modulus as usize) as u16),
+            true,
+            false,
+            true,
+        );
+
+        client.generate_secret_keys();
+        let pack_pub_params = raw_generate_expansion_params(
+            params,
+            &client.get_sk_reg(),
+            params.poly_len_log2,
+            params.t_exp_left,
+            &mut ChaCha20Rng::from_entropy(),
+            &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+        );
+        let pack_pub_params_row_1s = pack_pub_params
+            .iter()
+            .map(|p| condense_matrix(params, &p.submatrix(1, 0, 1, p.cols)))
+            .collect::<Vec<_>>();
+
+        let y_client = YClient::new(client, params);
+        let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, 3);
+        let packed_query_row = pack_query(params, &query_row);
+        let mut query = AlignedMemory64::new(params.db_rows_padded());
+        (&mut query.as_mut_slice()[..db_rows]).copy_from_slice(packed_query_row.as_slice());
+
+        (server, query, pack_pub_params_row_1s)
+    }
+
+    /// A restored server leaves `prepacked_lwe` empty, because `pack_many_lwes` reads it solely in
+    /// two `assert_eq!` shape checks. Pin that: neither zeroing every coefficient nor dropping the
+    /// field entirely may move the response by a single byte. If a refactor starts reading the
+    /// contents, this fails loudly instead of silently corrupting every persisted artifact.
+    #[test]
+    fn simplepir_online_ignores_prepacked_lwe_contents() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let mut client = Client::init(&params);
+        let (server, query, pack_pub_params_row_1s) = simplepir_fixture(&params, &mut client);
+        let pub_params = [pack_pub_params_row_1s.as_slice()];
+
+        let offline = server.perform_offline_precomputation_simplepir(None);
+        let expected =
+            server.perform_online_computation_simplepir(query.as_slice(), &offline, &pub_params, None);
+
+        let mut zeroed = offline.clone();
+        for pms in zeroed.prepacked_lwe.iter_mut() {
+            for pm in pms.iter_mut() {
+                pm.as_mut_slice().fill(0);
+            }
+        }
+        let with_zeros =
+            server.perform_online_computation_simplepir(query.as_slice(), &zeroed, &pub_params, None);
+
+        assert_eq!(with_zeros, expected);
+
+        let mut emptied = offline.clone();
+        emptied.prepacked_lwe = vec![];
+        let with_empty =
+            server.perform_online_computation_simplepir(query.as_slice(), &emptied, &pub_params, None);
+
+        assert_eq!(with_empty, expected);
+    }
+
+    /// The other invariant the tail rests on: row 1 of `precomp.0` is entropy-tainted but is
+    /// overwritten by `pack_using_precomp_vals` before it is read, so clobbering it is a no-op.
+    #[test]
+    fn simplepir_precomp_ignores_res_row_1() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let mut client = Client::init(&params);
+        let (server, query, pack_pub_params_row_1s) = simplepir_fixture(&params, &mut client);
+        let pub_params = [pack_pub_params_row_1s.as_slice()];
+
+        let offline = server.perform_offline_precomputation_simplepir(None);
+        let expected =
+            server.perform_online_computation_simplepir(query.as_slice(), &offline, &pub_params, None);
+
+        let mut clobbered = offline.clone();
+        for (res, _, _) in clobbered.precomp.iter_mut() {
+            res.get_poly_mut(1, 0).fill(0);
+        }
+        let with_clobbered = server.perform_online_computation_simplepir(
+            query.as_slice(),
+            &clobbered,
+            &pub_params,
+            None,
+        );
+
+        assert_eq!(with_clobbered, expected);
+
+        // ...and a second, independent entropy draw must reach the same response.
+        let redrawn = server.perform_offline_precomputation_simplepir_from_hint(offline.hint_0.clone());
+        let with_redrawn =
+            server.perform_online_computation_simplepir(query.as_slice(), &redrawn, &pub_params, None);
+        assert_eq!(with_redrawn, expected);
+    }
+
+    #[test]
+    fn offline_tail_round_trips_through_bytes() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let mut client = Client::init(&params);
+        let (server, query, pack_pub_params_row_1s) = simplepir_fixture(&params, &mut client);
+        let pub_params = [pack_pub_params_row_1s.as_slice()];
+
+        let fresh_offline = server.perform_offline_precomputation_simplepir(None);
+        let fresh_response = server.perform_online_computation_simplepir(
+            query.as_slice(),
+            &fresh_offline,
+            &pub_params,
+            None,
+        );
+
+        // Go through the serialized byte form, so this exercises the artifact rather than handing
+        // the restored server the originals.
+        let bytes = fresh_offline.offline_tail().to_bytes();
+        let tail = OfflineTail::from_bytes(&bytes).unwrap();
+        assert_eq!(bytes.len(), tail.encoded_len());
+
+        let restored_offline = server
+            .perform_offline_precomputation_simplepir_from_parts(
+                fresh_offline.hint_0.clone(),
+                &tail,
+            )
+            .unwrap();
+
+        // The tail carries no entropy, so a second extraction must be byte-identical.
+        assert_eq!(restored_offline.offline_tail().to_bytes(), bytes);
+
+        let restored_response = server.perform_online_computation_simplepir(
+            query.as_slice(),
+            &restored_offline,
+            &pub_params,
+            None,
+        );
+        assert_eq!(restored_response, fresh_response);
+    }
+
+    /// The drift server falls back to recomputing from the hint, so a bad artifact must produce an
+    /// `Err` rather than a panic or, worse, a wrong answer.
+    #[test]
+    fn offline_tail_rejects_mismatched_bytes() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let mut client = Client::init(&params);
+        let (server, _query, _pub_params) = simplepir_fixture(&params, &mut client);
+        let offline = server.perform_offline_precomputation_simplepir(None);
+        let hint_0 = offline.hint_0.clone();
+        let bytes = offline.offline_tail().to_bytes();
+
+        assert!(OfflineTail::from_bytes(&[]).is_err(), "empty");
+        assert!(OfflineTail::from_bytes(&bytes[..bytes.len() - 1]).is_err(), "truncated");
+
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(OfflineTail::from_bytes(&extra).is_err(), "trailing bytes");
+
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(OfflineTail::from_bytes(&bad_magic).is_err(), "bad magic");
+
+        let mut bad_version = bytes.clone();
+        bad_version[8] ^= 0xff;
+        assert!(OfflineTail::from_bytes(&bad_version).is_err(), "bad version");
+
+        // A structurally valid tail built for other params must be rejected on rebuild.
+        let other_params = params_for_scenario_simplepir(1 << 12, 4096 * 8);
+        let tail = OfflineTail::from_bytes(&bytes).unwrap();
+        assert!(offline_values_from_parts(&other_params, hint_0.clone(), &tail).is_err());
+
+        // As must a hint of the wrong length...
+        assert!(offline_values_from_parts(&params, vec![0u64; 7], &tail).is_err());
+
+        // ...and, most importantly, a correctly shaped hint that is simply not the one this tail
+        // was built from. Nothing in the params catches this -- `db_dim_1` never reaches the tail
+        // -- so without the checksum the server would answer queries wrongly and silently.
+        let mut wrong_hint = hint_0.clone();
+        wrong_hint[0] ^= 1;
+        assert!(offline_values_from_parts(&params, wrong_hint, &tail).is_err());
+
+        // The matching hint, of course, must still be accepted.
+        assert!(offline_values_from_parts(&params, hint_0, &tail).is_ok());
     }
 }
 

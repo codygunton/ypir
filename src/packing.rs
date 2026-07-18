@@ -1078,8 +1078,14 @@ pub fn pack_many_lwes<'a>(
     pack_pub_params_row_1s: &[PolyMatrixNTT<'a>],
     y_constants: &(Vec<PolyMatrixNTT<'a>>, Vec<PolyMatrixNTT<'a>>),
 ) -> Vec<PolyMatrixNTT<'a>> {
-    assert_eq!(prep_rlwe_cts.len(), num_rlwe_outputs);
-    assert_eq!(prep_rlwe_cts[0].len(), params.poly_len);
+    // `prep_rlwe_cts` is not otherwise read here: `pack_using_precomp_vals` works entirely from
+    // `precomp`, which was built from these ciphertexts offline. A server restored from a
+    // persisted tail therefore has nothing to pass and supplies an empty slice rather than
+    // allocating gigabytes of placeholders. See `src/offline_tail.rs`.
+    if !prep_rlwe_cts.is_empty() {
+        assert_eq!(prep_rlwe_cts.len(), num_rlwe_outputs);
+        assert_eq!(prep_rlwe_cts[0].len(), params.poly_len);
+    }
     assert_eq!(b_values.len(), num_rlwe_outputs * params.poly_len);
 
     let mut res = Vec::new();

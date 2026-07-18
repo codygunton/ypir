@@ -9,6 +9,7 @@ pub mod matmul;
 pub mod measurement;
 pub mod modulus_switch;
 pub mod noise_analysis;
+pub mod offline_tail;
 pub mod packing;
 pub mod params;
 pub mod scheme;
