@@ -1260,6 +1260,19 @@ where
 mod tests {
     use super::*;
 
+    /// `PolyMatrixNTT` has no `PartialEq`, so compare shape plus raw coefficients.
+    fn assert_pm_eq(a: &PolyMatrixNTT, b: &PolyMatrixNTT) {
+        assert_eq!((a.rows, a.cols), (b.rows, b.cols));
+        assert_eq!(a.as_slice(), b.as_slice());
+    }
+
+    fn assert_pms_eq(a: &[PolyMatrixNTT], b: &[PolyMatrixNTT]) {
+        assert_eq!(a.len(), b.len());
+        for (a_pm, b_pm) in a.iter().zip(b.iter()) {
+            assert_pm_eq(a_pm, b_pm);
+        }
+    }
+
     #[test]
     fn preformatted_simplepir_db_and_hint_match_fresh_server() {
         let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
@@ -1273,24 +1286,144 @@ mod tests {
             true,
         );
         let fresh_offline = fresh.perform_offline_precomputation_simplepir(None);
+
+        // Rebuild through the persisted byte forms, so this exercises the artifact round-trip
+        // rather than handing the restored server the originals: the database as the raw
+        // column-major bytes, and the hint as the little-endian u64 stream stored in `hint.bin`.
+        let persisted_hint = fresh_offline
+            .hint_0
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>()
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<u64>>();
         let restored =
             YServer::<u16>::from_col_major(&params, true, true, fresh.db_col_major_bytes());
-        let restored_offline = restored
-            .perform_offline_precomputation_simplepir_from_hint(fresh_offline.hint_0.clone());
+        let restored_offline =
+            restored.perform_offline_precomputation_simplepir_from_hint(persisted_hint);
 
         assert_eq!(restored.db_col_major_bytes(), fresh.db_col_major_bytes());
         assert_eq!(restored_offline.hint_0, fresh_offline.hint_0);
+
+        // The offline values must match in content, not merely in shape.
         assert_eq!(
             restored_offline.prepacked_lwe.len(),
             fresh_offline.prepacked_lwe.len()
         );
-        assert_eq!(restored_offline.precomp.len(), fresh_offline.precomp.len());
-
-        let query = vec![0; params.db_rows_padded()];
-        assert_eq!(
-            as_bytes(&restored.answer_query(&query)),
-            as_bytes(&fresh.answer_query(&query))
+        for (restored_pms, fresh_pms) in restored_offline
+            .prepacked_lwe
+            .iter()
+            .zip(fresh_offline.prepacked_lwe.iter())
+        {
+            assert_pms_eq(restored_pms, fresh_pms);
+        }
+        assert_pms_eq(
+            &restored_offline.y_constants.0,
+            &fresh_offline.y_constants.0,
         );
+        assert_pms_eq(
+            &restored_offline.y_constants.1,
+            &fresh_offline.y_constants.1,
+        );
+        // `fake_pack_pub_params` is drawn from entropy by `generate_fake_pack_pub_params`, so it
+        // (and the `precomp` entries derived from it) can only be compared by shape. The packing
+        // step cancels these placeholders out, so the online responses must still match exactly.
+        assert_eq!(
+            restored_offline.fake_pack_pub_params.len(),
+            fresh_offline.fake_pack_pub_params.len()
+        );
+        assert_eq!(restored_offline.precomp.len(), fresh_offline.precomp.len());
+        for (restored_tup, fresh_tup) in restored_offline
+            .precomp
+            .iter()
+            .zip(fresh_offline.precomp.iter())
+        {
+            assert_eq!(
+                (restored_tup.0.rows, restored_tup.0.cols),
+                (fresh_tup.0.rows, fresh_tup.0.cols)
+            );
+            assert_eq!(restored_tup.1.len(), fresh_tup.1.len());
+            assert_eq!(restored_tup.2, fresh_tup.2);
+        }
+
+        // Generate a real client query for a known row, as in `run_simple_ypir_on_params`.
+        let target_row = 3;
+        let mut client = Client::init(&params);
+        client.generate_secret_keys();
+        let sk_reg = &client.get_sk_reg();
+        let pack_pub_params = raw_generate_expansion_params(
+            &params,
+            &sk_reg,
+            params.poly_len_log2,
+            params.t_exp_left,
+            &mut ChaCha20Rng::from_entropy(),
+            &mut ChaCha20Rng::from_seed(STATIC_SEED_2),
+        );
+        let mut pack_pub_params_row_1s = pack_pub_params.to_vec();
+        for i in 0..pack_pub_params.len() {
+            pack_pub_params_row_1s[i] =
+                pack_pub_params[i].submatrix(1, 0, 1, pack_pub_params[i].cols);
+            pack_pub_params_row_1s[i] = condense_matrix(&params, &pack_pub_params_row_1s[i]);
+        }
+        let y_client = YClient::new(&mut client, &params);
+        let query_row = y_client.generate_query(SEED_0, params.db_dim_1, true, target_row);
+        assert_eq!(query_row.len(), db_rows);
+        let packed_query_row = pack_query(&params, &query_row);
+
+        // The query must be 64-byte aligned for the AVX-512 kernel.
+        let mut query = AlignedMemory64::new(params.db_rows_padded());
+        (&mut query.as_mut_slice()[..db_rows]).copy_from_slice(packed_query_row.as_slice());
+
+        assert_eq!(
+            as_bytes(&restored.answer_query(query.as_slice())),
+            as_bytes(&fresh.answer_query(query.as_slice()))
+        );
+
+        // The full online responses must be byte-identical.
+        let pack_pub_params_row_1s = [pack_pub_params_row_1s.as_slice()];
+        let fresh_response = fresh.perform_online_computation_simplepir(
+            query.as_slice(),
+            &fresh_offline,
+            &pack_pub_params_row_1s,
+            None,
+        );
+        let restored_response = restored.perform_online_computation_simplepir(
+            query.as_slice(),
+            &restored_offline,
+            &pack_pub_params_row_1s,
+            None,
+        );
+        assert_eq!(restored_response, fresh_response);
+
+        // ...and so must the decoded plaintexts, which must equal the original DB record.
+        let decode = |response: &[Vec<u8>]| {
+            response
+                .iter()
+                .flat_map(|ct_bytes| {
+                    let ct = PolyMatrixRaw::recover(
+                        &params,
+                        params.get_q_prime_1(),
+                        params.get_q_prime_2(),
+                        ct_bytes,
+                    );
+                    decrypt_ct_reg_measured(y_client.client(), &params, &ct.ntt(), params.poly_len)
+                        .as_slice()
+                        .to_vec()
+                })
+                .collect::<Vec<u64>>()
+        };
+        // Ground truth comes from the source data the database was built from, not from reading
+        // the server back through `get_row` -- otherwise a mis-laid-out ingest would agree with
+        // itself and go unnoticed.
+        let corr_result = (0..db_cols)
+            .map(|col| ((target_row * db_cols + col) % params.pt_modulus as usize) as u64)
+            .collect::<Vec<u64>>();
+        let fresh_decoded = decode(&fresh_response);
+        let restored_decoded = decode(&restored_response);
+        assert_eq!(fresh_decoded.len(), db_cols);
+        assert_eq!(fresh_decoded, corr_result);
+        assert_eq!(restored_decoded, corr_result);
     }
 }
 
