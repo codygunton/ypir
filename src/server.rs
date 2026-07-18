@@ -267,6 +267,58 @@ where
         }
     }
 
+    /// Builds a server from the column-major database layout consumed by SimplePIR.
+    pub fn from_col_major(
+        params: &'a Params,
+        is_simplepir: bool,
+        pad_rows: bool,
+        buf: &[u8],
+    ) -> Self {
+        let mut ypir_params = YPIRParams::default();
+        ypir_params.is_simplepir = is_simplepir;
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_rows_padded = if pad_rows {
+            params.db_rows_padded()
+        } else {
+            db_rows
+        };
+        let db_cols = if is_simplepir {
+            params.instances * params.poly_len
+        } else {
+            1 << (params.db_dim_2 + params.poly_len_log2)
+        };
+        let expected_len = db_rows_padded * db_cols * std::mem::size_of::<T>();
+        assert_eq!(buf.len(), expected_len);
+        assert_eq!(expected_len % 8, 0);
+
+        let mut db_buf_aligned = AlignedMemory64::new(expected_len / 8);
+        as_bytes_mut(&mut db_buf_aligned).copy_from_slice(buf);
+
+        let smaller_params = if is_simplepir {
+            params.clone()
+        } else {
+            let lwe_params = LWEParams::default();
+            let pt_bits = (params.pt_modulus as f64).log2().floor() as usize;
+            let blowup_factor = lwe_params.q2_bits as f64 / pt_bits as f64;
+            let mut smaller_params = params.clone();
+            smaller_params.db_dim_1 = params.db_dim_2;
+            smaller_params.db_dim_2 = ((blowup_factor * (lwe_params.n + 1) as f64)
+                / params.poly_len as f64)
+                .log2()
+                .ceil() as usize;
+            smaller_params
+        };
+
+        Self {
+            params,
+            smaller_params,
+            db_buf_aligned,
+            phantom: PhantomData,
+            pad_rows,
+            ypir_params,
+        }
+    }
+
     pub fn db_rows_padded(&self) -> usize {
         if self.pad_rows {
             self.params.db_rows_padded()
@@ -584,8 +636,6 @@ where
         assert!(self.ypir_params.is_simplepir);
 
         let db_cols = params.instances * params.poly_len;
-        let num_rlwe_outputs = db_cols / params.poly_len;
-
         // Begin offline precomputation
 
         let now = Instant::now();
@@ -595,6 +645,20 @@ where
         if let Some(measurement) = measurement {
             measurement.offline.simplepir_prep_time_ms = simplepir_prep_time_ms as usize;
         }
+
+        self.perform_offline_precomputation_simplepir_from_hint(hint_0)
+    }
+
+    /// Rebuilds the cheap SimplePIR offline values from a persisted database hint.
+    pub fn perform_offline_precomputation_simplepir_from_hint(
+        &self,
+        hint_0: Vec<u64>,
+    ) -> OfflinePrecomputedValues {
+        let params = self.params;
+        assert!(self.ypir_params.is_simplepir);
+        let db_cols = params.instances * params.poly_len;
+        assert_eq!(hint_0.len(), params.poly_len * db_cols);
+        let num_rlwe_outputs = db_cols / params.poly_len;
 
         let now = Instant::now();
         let y_constants = generate_y_constants(&params);
@@ -1141,6 +1205,10 @@ where
         }
     }
 
+    pub fn db_col_major_bytes(&self) -> &[u8] {
+        as_bytes(&self.db_buf_aligned)
+    }
+
     pub fn db_mut(&mut self) -> &mut [T] {
         unsafe {
             std::slice::from_raw_parts_mut(
@@ -1185,6 +1253,44 @@ where
         //     res_u8.extend_from_slice(&x.to_u64().to_le_bytes()[..std::mem::size_of::<T>()]);
         // }
         // res_u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preformatted_simplepir_db_and_hint_match_fresh_server() {
+        let params = params_for_scenario_simplepir(1 << 12, 2048 * 8);
+        let db_rows = 1 << (params.db_dim_1 + params.poly_len_log2);
+        let db_cols = params.instances * params.poly_len;
+        let fresh = YServer::<u16>::new(
+            &params,
+            (0..db_rows * db_cols).map(|i| (i % params.pt_modulus as usize) as u16),
+            true,
+            false,
+            true,
+        );
+        let fresh_offline = fresh.perform_offline_precomputation_simplepir(None);
+        let restored =
+            YServer::<u16>::from_col_major(&params, true, true, fresh.db_col_major_bytes());
+        let restored_offline = restored
+            .perform_offline_precomputation_simplepir_from_hint(fresh_offline.hint_0.clone());
+
+        assert_eq!(restored.db_col_major_bytes(), fresh.db_col_major_bytes());
+        assert_eq!(restored_offline.hint_0, fresh_offline.hint_0);
+        assert_eq!(
+            restored_offline.prepacked_lwe.len(),
+            fresh_offline.prepacked_lwe.len()
+        );
+        assert_eq!(restored_offline.precomp.len(), fresh_offline.precomp.len());
+
+        let query = vec![0; params.db_rows_padded()];
+        assert_eq!(
+            as_bytes(&restored.answer_query(&query)),
+            as_bytes(&fresh.answer_query(&query))
+        );
     }
 }
 
